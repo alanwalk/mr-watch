@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>MR Watch · 自动跟进控制台</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span class="brand-text"><strong>MR Watch</strong><small>自动跟进控制台</small></span>
+      </a>
+
+      <nav class="nav" aria-label="页面导航">
+        <a class="nav-item active" href="#overview">
+          <span class="nav-icon">◈</span><span>概览</span>
+        </a>
+        <a class="nav-item" href="#allocations">
+          <span class="nav-icon">⌁</span><span>分配</span>
+        </a>
+        <a class="nav-item" href="#active">
+          <span class="nav-icon">◉</span><span>当前活跃</span>
+        </a>
+        <a class="nav-item" href="#agents">
+          <span class="nav-icon">◎</span><span>注册会话</span>
+        </a>
+        <a class="nav-item" href="#settings">
+          <span class="nav-icon">⚙</span><span>接入设置</span>
+        </a>
+        <a class="nav-item" href="#history">
+          <span class="nav-icon">↺</span><span>历史任务</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-card">
+        <div class="status-line">
+          <span class="status-dot" id="sidebar-status-dot"></span>
+          <span id="sidebar-role">审核端</span>
+          <span class="status-label" id="sidebar-status">连接中</span>
+        </div>
+        <p id="sidebar-summary">等待第一次轮询...</p>
+        <div class="progress-track"><div class="progress-fill" id="poll-progress"></div></div>
+        <div class="sidebar-meta">
+          <span id="next-poll">--</span>
+          <span id="poll-interval">60s</span>
+        </div>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="pulse"></span>
+        <span>本地管理页面</span>
+        <code id="dashboard-url">127.0.0.1</code>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="breadcrumb"><span>workspace</span><span>/</span><span>MR 自动跟进</span></div>
+          <div class="title-row">
+            <h1>审查分配</h1>
+            <span class="live-pill" id="live-pill"><span class="live-dot"></span><span id="live-label">实时</span></span>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span class="role-pill" id="role-pill">审核端</span>
+          <button class="icon-btn" id="refresh-btn" title="刷新页面" aria-label="刷新页面">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.6-4.7L3 9m0 0V4m0 5h5M4 13a8.1 8.1 0 0 0 14.6 4.7L21 15m0 0v5m0-5h-5"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="hero" id="overview">
+        <div class="hero-content">
+          <div class="eyebrow">REVIEW ROUTING</div>
+          <h2>让每个 MR 都有人接着看。</h2>
+          <p>每分钟检查 GitLab，MR 状态变化直接分配给对应的审查线程。</p>
+          <div class="hero-pills">
+            <span class="chip" id="project-pill">team/project</span>
+            <span class="chip soft" id="last-poll-chip">上次检查 --</span>
+            <span class="chip soft" id="poll-speed-chip">60 秒 / 轮</span>
+          </div>
+        </div>
+
+        <div class="orbit-card" aria-label="数据流示意">
+          <div class="orbit-grid"></div>
+          <div class="orbit-ring ring-one"></div>
+          <div class="orbit-ring ring-two"></div>
+          <div class="orbit-core">
+            <span class="core-dot"></span>
+            <strong>WATCH</strong>
+            <small>auto follow</small>
+          </div>
+          <div class="orbit-node node-project">
+            <span class="node-icon">G</span>
+            <span><strong id="orbit-project">team/project</strong><small>GitLab</small></span>
+          </div>
+          <div class="orbit-node node-orchestrator">
+            <span class="node-icon">W</span>
+            <span><strong>状态路由</strong><small id="orbit-orchestrator">app server</small></span>
+          </div>
+          <div class="orbit-node node-review">
+            <span class="node-icon">R</span>
+            <span><strong>审查线程</strong><small id="orbit-review-count">0 mapped</small></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="stats-grid" aria-label="运行统计">
+        <article class="stat-card accent-blue">
+          <div class="stat-top"><span>当前活跃 MR</span><span class="stat-icon">◉</span></div>
+          <strong data-count="activeCount">0</strong>
+          <small>最近一轮仍在跟踪</small>
+        </article>
+        <article class="stat-card accent-purple">
+          <div class="stat-top"><span>审查映射</span><span class="stat-icon">↗</span></div>
+          <strong data-count="mappingCount">0</strong>
+          <small>MR → 会话</small>
+        </article>
+        <article class="stat-card accent-green">
+          <div class="stat-top"><span>历史事件</span><span class="stat-icon">✦</span></div>
+          <strong data-count="eventCount">0</strong>
+          <small>最近 200 条</small>
+        </article>
+        <article class="stat-card accent-orange">
+          <div class="stat-top"><span>轮询间隔</span><span class="stat-icon">◷</span></div>
+          <strong id="stat-interval">60s</strong>
+          <small>自动检查节奏</small>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel allocation-panel" id="allocations">
+          <div class="panel-head">
+            <div><div class="eyebrow">ALLOCATION</div><h3>分配关系</h3></div>
+            <button class="primary-btn" id="toggle-mapping-form" type="button">+ 新增映射</button>
+          </div>
+
+          <div class="flow-strip">
+            <div class="flow-node flow-project">
+              <span class="flow-kicker">PROJECT</span>
+              <strong id="flow-project">team/project</strong>
+            </div>
+            <div class="flow-link"><span></span></div>
+            <div class="flow-node flow-orchestrator">
+              <span class="flow-kicker">WATCHER</span>
+              <strong>状态路由</strong>
+            </div>
+            <div class="flow-link"><span></span></div>
+            <div class="flow-node flow-review">
+              <span class="flow-kicker">THREADS</span>
+              <strong id="flow-thread-count">0</strong>
+            </div>
+          </div>
+
+          <form class="mapping-form" id="mapping-form">
+            <div class="form-row">
+              <label>分配键
+                <input id="mapping-key" placeholder="team/project!24" autocomplete="off">
+              </label>
+              <label>会话 UUID
+                <input id="mapping-thread" placeholder="01a1..." autocomplete="off">
+              </label>
+              <button class="primary-btn" type="submit">保存映射</button>
+              <button class="ghost-btn" type="button" id="cancel-mapping">取消</button>
+            </div>
+            <p class="form-hint">格式：项目路径!MR IID。保存后 watcher 下一轮自动读取。</p>
+          </form>
+
+          <div class="mapping-list" id="mapping-list">
+            <div class="skeleton-row"></div>
+            <div class="skeleton-row"></div>
+            <div class="skeleton-row short"></div>
+          </div>
+        </article>
+
+        <aside class="panel guide-panel">
+          <div class="eyebrow">HOW TO MANAGE</div>
+          <h3>如何管理分配</h3>
+          <ol class="guide-list">
+            <li>
+              <span>01</span>
+              <div><strong>新 MR 自动分配</strong><p>审核端发现未映射 MR，会通过 App Server 直接创建审查线程。</p></div>
+            </li>
+            <li>
+              <span>02</span>
+              <div><strong>手动补充映射</strong><p>填写 <code>项目!IID</code> 和 thread UUID，下一轮生效。</p></div>
+            </li>
+            <li>
+              <span>03</span>
+              <div><strong>改错或重审</strong><p>删除旧映射后重新保存；不会影响已有会话历史。</p></div>
+            </li>
+          </ol>
+          <div class="guide-note">
+            <span class="guide-spark">✦</span>
+            <p>审核 agent 发布 MR 评论时，正文开头加 <code>&lt;!-- codex-review --&gt;</code>，避免被 watcher 当成新的审查信号。</p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel agents-panel" id="agents">
+        <div class="panel-head">
+          <div><div class="eyebrow">AGENT REGISTRY</div><h3>注册会话</h3></div>
+          <span class="soft-badge" id="agent-badge">0 个</span>
+        </div>
+        <div class="agent-list" id="agent-list">
+          <div class="empty-state">还没有 agent 注册。使用 <code>npx @alanwalk/mr-watch register ...</code> 注册会话或 hook。</div>
+        </div>
+      </section>
+
+      <section class="panel settings-panel" id="settings">
+        <div class="panel-head">
+          <div><div class="eyebrow">GITLAB ACCESS</div><h3>接入设置</h3></div>
+          <span class="soft-badge auth-badge" id="auth-badge">读取中</span>
+        </div>
+
+        <div class="auth-grid">
+          <div class="auth-status-card" id="auth-status-card">
+            <div class="auth-visual" id="auth-visual" aria-hidden="true">
+              <span class="auth-ring auth-ring-one"></span>
+              <span class="auth-ring auth-ring-two"></span>
+              <span class="auth-glyph">G</span>
+            </div>
+            <div class="auth-copy">
+              <div class="auth-kicker">WORKSPACE REMOTE</div>
+              <strong id="auth-user">正在读取 Git remote...</strong>
+              <p id="auth-summary">GitLab 地址会从当前 workspace 的 origin 自动解析。</p>
+              <div class="auth-remote-row">
+                <code id="auth-remote">--</code>
+                <button class="mini-btn" id="copy-auth-remote" type="button">复制</button>
+              </div>
+            </div>
+          </div>
+
+          <form class="auth-form" id="auth-form">
+            <div class="auth-form-head">
+              <div>
+                <span class="auth-step">QUICK CONNECT</span>
+                <strong>粘贴 Personal Access Token</strong>
+              </div>
+              <span class="auth-scope">read_api</span>
+            </div>
+            <label class="token-label" for="auth-token">GitLab Token</label>
+            <div class="token-input-wrap">
+              <input id="auth-token" type="password" placeholder="glpat-..." autocomplete="new-password" spellcheck="false">
+              <button id="toggle-token" type="button">显示</button>
+            </div>
+            <div class="auth-actions">
+              <a class="primary-btn auth-link-btn" id="token-settings-link" href="#" target="_blank" rel="noreferrer">
+                创建 GitLab Token <span>↗</span>
+              </a>
+              <button class="ghost-btn auth-verify-btn" id="auth-submit" type="submit">保存并验证</button>
+            </div>
+            <p class="auth-hint">点击左侧按钮会打开当前 GitLab 的 Token 创建页。保存前会调用 <code>/api/v4/user</code> 验证，Token 仅写入本机 <code>.mr-watch/credentials.json</code>，页面不会回显。</p>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel active-panel" id="active">
+        <div class="panel-head">
+          <div><div class="eyebrow">LIVE QUEUE</div><h3>当前活跃</h3></div>
+          <span class="soft-badge" id="active-badge">0 个</span>
+        </div>
+        <div class="active-list" id="active-list">
+          <div class="empty-state">正在读取...</div>
+        </div>
+      </section>
+
+      <section class="panel history-panel" id="history">
+        <div class="panel-head">
+          <div><div class="eyebrow">ACTIVITY</div><h3>历史任务</h3></div>
+          <span class="soft-badge" id="history-badge">最近 200 条</span>
+        </div>
+        <div class="history-filters" id="history-filters">
+          <button class="filter-btn active" data-filter="all" type="button">全部</button>
+          <button class="filter-btn" data-filter="mr_update" type="button">MR 变化</button>
+          <button class="filter-btn" data-filter="thread_created" type="button">创建线程</button>
+          <button class="filter-btn" data-filter="agent_notified" type="button">Agent 通知</button>
+          <button class="filter-btn" data-filter="developer_notify" type="button">开发通知</button>
+          <button class="filter-btn" data-filter="gitlab_authenticated" type="button">GitLab 认证</button>
+          <button class="filter-btn" data-filter="error" type="button">错误</button>
+        </div>
+        <div class="history-list" id="history-list">
+          <div class="empty-state">还没有历史事件。</div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span>MR Watch · local control plane</span>
+        <span id="last-updated">--</span>
+      </footer>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

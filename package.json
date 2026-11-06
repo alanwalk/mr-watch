@@ -1,0 +1,36 @@
+{
+  "name": "@alanwalk/mr-watch",
+  "version": "0.1.0",
+  "description": "Local GitLab MR state watcher with App Server review routing and agent registration",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alanwalk/mr-watch.git"
+  },
+  "homepage": "https://github.com/alanwalk/mr-watch#readme",
+  "bugs": {
+    "url": "https://github.com/alanwalk/mr-watch/issues"
+  },
+  "type": "module",
+  "bin": {
+    "mr-watch": "bin/mr-watch.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "watch.mjs",
+    "app-server-client.mjs",
+    "dashboard.html",
+    "dashboard.css",
+    "dashboard.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node --check bin/mr-watch.mjs && node --check watch.mjs && node --check app-server-client.mjs && node --check src/workspace.mjs && node --check src/registry.mjs && node --check src/gitlab-client.mjs && node --check dashboard.js"
+  }
+}
