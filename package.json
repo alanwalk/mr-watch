@@ -31,6 +31,7 @@
     "access": "public"
   },
   "scripts": {
-    "check": "node --check bin/mr-watch.mjs && node --check watch.mjs && node --check app-server-client.mjs && node --check src/workspace.mjs && node --check src/registry.mjs && node --check src/gitlab-client.mjs && node --check dashboard.js"
+    "check": "node --check bin/mr-watch.mjs && node --check watch.mjs && node --check app-server-client.mjs && node --check src/workspace.mjs && node --check src/registry.mjs && node --check src/gitlab-client.mjs && node --check dashboard.js",
+    "test": "node --test test/*.test.mjs"
   }
 }

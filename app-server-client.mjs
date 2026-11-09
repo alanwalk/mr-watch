@@ -40,15 +40,17 @@ export class AppServerClient {
 
   async createReviewThread({
     title,
+    cwd,
     prompt,
     developerInstructions,
     model,
     effort,
   }) {
+    if (!cwd) throw new Error('创建审查线程必须显式指定项目 cwd');
     await this.connect();
 
     const threadStartParams = {
-      cwd: this.cwd,
+      cwd,
       approvalPolicy: 'never',
       sandbox: 'read-only',
       ephemeral: false,
@@ -207,11 +209,16 @@ export class AppServerClient {
       return;
     }
 
+    this.startupError = null;
     this.appServerProcess = spawn('codex', ['app-server', '--listen', this.url], {
       cwd: this.cwd,
       detached: true,
       windowsHide: true,
       stdio: 'ignore',
+    });
+    this.appServerProcess.on('error', (error) => {
+      this.startupError = error;
+      this.appServerProcess = null;
     });
     this.appServerProcess.unref();
   }
@@ -221,6 +228,7 @@ export class AppServerClient {
     let lastError = null;
 
     while (Date.now() < deadline) {
+      if (this.startupError) throw new Error(`app-server 启动失败: ${this.startupError.message}`);
       try {
         await this.openSocket(1_000);
         return;

@@ -1,6 +1,7 @@
 import {
   loadAgentRegistry,
   saveAgentRegistry,
+  getProjectPath,
 } from './workspace.mjs';
 
 function normalizeProjects(projects, fallbackProjects) {
@@ -10,7 +11,7 @@ function normalizeProjects(projects, fallbackProjects) {
 
   return [...new Set(
     values
-      .map((project) => String(project).trim().replace(/^\/+|\/+$/g, ''))
+      .map((project) => (typeof project === 'string' ? project : getProjectPath(project)).trim().replace(/^\/+|\/+$/g, ''))
       .filter((project) => project.length > 0),
   )];
 }
@@ -33,7 +34,7 @@ export function agentMatches(agent, project, mergeRequestIid) {
 }
 
 export async function registerAgent({
-  workspaceRoot,
+  serviceHome,
   config,
   threadId,
   hookUrl,
@@ -55,9 +56,12 @@ export async function registerAgent({
     }
   }
 
-  const registry = await loadAgentRegistry(workspaceRoot);
+  const registry = await loadAgentRegistry(serviceHome);
   const normalizedProjects = normalizeProjects(projects, config.projects);
   const normalizedMrIids = normalizeMergeRequestIids(mrIids);
+  if (normalizedMrIids.length && config.projects.length !== 1 && !projects?.length) {
+    throw new Error('多项目或零项目下 --mr 必须同时指定 --project');
+  }
   const now = new Date().toISOString();
   const existingAgent = registry.agents.find((agent) => {
     if (threadId && agent.threadId === threadId) {
@@ -74,7 +78,7 @@ export async function registerAgent({
     existingAgent.hookUrl = hookUrl || null;
     existingAgent.label = label || existingAgent.label;
     existingAgent.updatedAt = now;
-    await saveAgentRegistry(workspaceRoot, registry);
+    await saveAgentRegistry(serviceHome, registry);
     return existingAgent;
   }
 
@@ -90,12 +94,12 @@ export async function registerAgent({
     updatedAt: now,
   };
   registry.agents.push(agent);
-  await saveAgentRegistry(workspaceRoot, registry);
+  await saveAgentRegistry(serviceHome, registry);
   return agent;
 }
 
-export async function unregisterAgent({ workspaceRoot, id, threadId }) {
-  const registry = await loadAgentRegistry(workspaceRoot);
+export async function unregisterAgent({ serviceHome, id, threadId }) {
+  const registry = await loadAgentRegistry(serviceHome);
   const originalCount = registry.agents.length;
   registry.agents = registry.agents.filter((agent) => {
     if (id) {
@@ -111,11 +115,11 @@ export async function unregisterAgent({ workspaceRoot, id, threadId }) {
     return 0;
   }
 
-  await saveAgentRegistry(workspaceRoot, registry);
+  await saveAgentRegistry(serviceHome, registry);
   return originalCount - registry.agents.length;
 }
 
-export async function listAgents(workspaceRoot) {
-  const registry = await loadAgentRegistry(workspaceRoot);
+export async function listAgents(serviceHome) {
+  const registry = await loadAgentRegistry(serviceHome);
   return registry.agents;
 }

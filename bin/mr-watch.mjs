@@ -1,268 +1,191 @@
 #!/usr/bin/env node
-
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
 import {
-  getConfigPath,
-  getDataDir,
-  inferGitLabRemote,
-  loadOrCreateConfig,
-  resolveWorkspaceRoot,
-  saveGitLabToken,
+  getConfigPath, getProjectPath, loadOrCreateConfig, normalizeGitLabHost,
+  prepareProject, resolveServiceHome, saveGitLabToken, updateConfig,
 } from '../src/workspace.mjs';
-import {
-  listAgents,
-  registerAgent,
-  unregisterAgent,
-} from '../src/registry.mjs';
+import { listAgents, registerAgent, unregisterAgent } from '../src/registry.mjs';
 import { TokenGitLabClient } from '../src/gitlab-client.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const knownCommands = new Set(['start', 'init', 'auth', 'register', 'unregister', 'list']);
+const knownCommands = new Set(['start', 'init', 'auth', 'register', 'unregister', 'list', 'project']);
 
 function printHelp() {
-  console.log(`MR Watch
+  console.log(`MR Watch 独立服务
 
 用法:
-  npx @alanwalk/mr-watch
-  npx @alanwalk/mr-watch start --workspace C:\\Workspace\\my-project --role reviewer
-  npx @alanwalk/mr-watch auth --workspace C:\\Workspace\\my-project --token-stdin
-  npx @alanwalk/mr-watch register --workspace C:\\Workspace\\my-project --thread <thread-uuid> --role developer --mr 22
-  npx @alanwalk/mr-watch register --workspace C:\\Workspace\\my-project --hook-url http://127.0.0.1:9100/mr-watch --project team/project
-  npx @alanwalk/mr-watch list --workspace C:\\Workspace\\my-project
-  npx @alanwalk/mr-watch unregister --workspace C:\\Workspace\\my-project --id <agent-id>
-  npx @alanwalk/mr-watch init --workspace C:\\Workspace\\my-project
+  mr-watch [start] [--role reviewer|developer]
+  mr-watch init
+  mr-watch auth --host https://git.example.com --token-stdin
+  mr-watch project add --workspace /absolute/path/to/repo [--project team/project]
+  mr-watch project add --project team/project [--host https://git.example.com]
+  mr-watch project list
+  mr-watch project remove --project team/project
+  mr-watch register --thread <uuid> --role developer --project team/project --mr 22
+  mr-watch register --hook-url http://127.0.0.1:9100/mr-watch --project team/project
+  mr-watch list [--json]
+  mr-watch unregister --id <agent-id>
 
-认证参数:
-  --token <token>          直接提供 GitLab Personal Access Token
-  --token-stdin            从标准输入读取 Token，避免进入命令历史
-  --host <url>             覆盖从 origin remote 解析出的 GitLab 地址
+通用参数:
+  --home <path>           服务数据目录；优先于 MR_WATCH_HOME，默认 ~/.config/mr-watch
+  --config <path>         仅覆盖配置文件；其余数据仍位于服务目录
 
 启动参数:
-  --workspace <path>       工作区 Git 根目录，默认当前目录
-  --config <path>          覆盖配置文件路径，默认 <workspace>/.mr-watch/config.json
-  --role reviewer|developer
-  --project <path>         可重复或逗号分隔
-  --thread <uuid>          开发者模式目标会话
-  --notify <iid>           手动通知开发者继续处理
-  --interval <ms>          轮询间隔，默认 60000
-  --app-server-url <url>   默认 ws://127.0.0.1:18787
+  --role reviewer|developer  默认读取配置 role（reviewer）
+  --project <path>           仅轮询选中的已配置项目，可重复或逗号分隔
+  --notify <project!iid>     手动通知；纯 IID 仅限单项目或同时指定 --project
+  --mr <iid>                --notify 的别名
+  --thread <uuid>           developer 默认目标会话，优先使用项目 agent 路由
+  --interval <ms>           最小 10000，默认 60000
+  --app-server-url <url>    默认 ws://127.0.0.1:18787
   --review-model <model>
   --review-effort <effort>
-  --dashboard-port <port>  默认 8787
-  --dashboard-host <host>  默认 127.0.0.1
-  --no-dashboard
-  --once
-  --dry-run
+  --dashboard-host <host>   默认 127.0.0.1
+  --dashboard-port <port>   默认 8787
+  --no-dashboard --once --dry-run
+
+认证参数:
+  --host <url>              服务 GitLab 地址；已有项目时不可切换至其他 host
+  --token-stdin             从标准输入读取 Token
+  --token <token>           直接提供 Token
 
 注册参数:
-  --thread <uuid>          要接收通知的 Codex 会话
-  --hook-url <url>         HTTP 通知地址，可和 thread 二选一
-  --role developer|reviewer
-  --project <path>         可重复或逗号分隔
-  --mr <iid>               可重复或逗号分隔；为空表示该项目全部 MR
-  --label <text>
-  --json                   输出 JSON
+  --thread <uuid> 或 --hook-url <http(s) url>
+  --role developer|reviewer --project <path> --mr <iid> --label <text> --json
+  --project 和 --mr 支持重复或逗号分隔；多项目下 --mr 必须指定 --project
 `);
 }
 
 function extractOption(args, name) {
   const index = args.indexOf(name);
-  if (index < 0) {
-    return null;
-  }
-  const value = args[index + 1] ?? null;
+  if (index < 0) return null;
+  const value = args[index + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${name} 缺少值`);
   args.splice(index, 2);
   return value;
 }
-
 function extractAllOptions(args, name) {
   const values = [];
-  while (true) {
-    const value = extractOption(args, name);
-    if (value === null) {
-      break;
-    }
-    values.push(...String(value).split(',').map((item) => item.trim()).filter(Boolean));
+  for (let value; (value = extractOption(args, name)) !== null;) {
+    values.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
   }
   return values;
 }
-
 function hasFlag(args, name) {
   const index = args.indexOf(name);
-  if (index < 0) {
-    return false;
-  }
+  if (index < 0) return false;
   args.splice(index, 1);
   return true;
 }
-
-async function readPackageVersion() {
-  const packageJson = JSON.parse(
-    await readFile(resolve(packageRoot, 'package.json'), 'utf8'),
-  );
-  return packageJson.version;
-}
-
-async function readStdinText() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks).toString('utf8').trim();
+function assertNoArguments(args) {
+  if (args.length) throw new Error(`未知参数: ${args.join(' ')}`);
 }
 
 async function main() {
-  const rawArgs = process.argv.slice(2);
-
-  if (rawArgs.includes('--version') || rawArgs.includes('-v')) {
-    console.log(await readPackageVersion());
+  const args = process.argv.slice(2);
+  if (args.includes('--version') || args.includes('-v')) {
+    console.log(JSON.parse(await readFile(resolve(packageRoot, 'package.json'), 'utf8')).version);
     return;
   }
-
-  if (rawArgs[0] === 'help' || rawArgs[0] === '--help' || rawArgs[0] === '-h') {
-    printHelp();
-    return;
+  if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
+    printHelp(); return;
   }
-
-  const command = knownCommands.has(rawArgs[0]) ? rawArgs.shift() : 'start';
-  const workspaceArg = extractOption(rawArgs, '--workspace') ?? process.cwd();
-  const configOverride = extractOption(rawArgs, '--config');
-  const workspaceRoot = resolveWorkspaceRoot(workspaceArg);
-  const configPath = getConfigPath(workspaceRoot, configOverride);
+  const serviceHome = resolveServiceHome(extractOption(args, '--home'));
+  const configPath = getConfigPath(serviceHome, extractOption(args, '--config'));
+  const command = knownCommands.has(args[0]) ? args.shift() : 'start';
+  const store = { serviceHome, configPath };
+  const config = await loadOrCreateConfig(store);
 
   if (command === 'init') {
-    const config = await loadOrCreateConfig({ workspaceRoot, configPath });
-    console.log(`workspace=${workspaceRoot}`);
-    console.log(`dataDir=${getDataDir(workspaceRoot)}`);
-    console.log(`config=${configPath}`);
-    console.log(`projects=${config.projects.join(',')}`);
+    assertNoArguments(args);
+    console.log(`home=${serviceHome}\nconfig=${configPath}\nprojects=${config.projects.map(getProjectPath).join(',')}`);
     return;
   }
-
-  if (command === 'auth') {
-    const hostOverride = extractOption(rawArgs, '--host');
-    const tokenOption = extractOption(rawArgs, '--token');
-    const tokenFromStdin = hasFlag(rawArgs, '--token-stdin');
-    const gitlabInfo = inferGitLabRemote(workspaceRoot);
-    const host = hostOverride
-      ? String(hostOverride).trim().replace(/\/+$/, '')
-      : gitlabInfo.host;
-    const token = tokenFromStdin
-      ? await readStdinText()
-      : tokenOption;
-
-    console.log(`workspace=${workspaceRoot}`);
-    console.log(`gitlab=${host}/${gitlabInfo.project}`);
-    console.log(`tokenPage=${gitlabInfo.tokenSettingsUrl}`);
-
-    if (!token) {
-      throw new Error('缺少 Token，请使用 --token-stdin 从标准输入读取，或使用 --token');
+  if (command === 'project') {
+    const action = args.shift();
+    const path = extractOption(args, '--project');
+    const workspace = extractOption(args, '--workspace');
+    const host = extractOption(args, '--host');
+    assertNoArguments(args);
+    if (action === 'list') {
+      console.log(JSON.stringify(config.projects, null, 2)); return;
     }
-
-    const gitlab = new TokenGitLabClient({ host, token });
-    const currentUser = await gitlab.currentUser();
-    await saveGitLabToken({ workspaceRoot, host, token });
-
-    console.log(`currentUser=${currentUser}`);
-    console.log('GitLab Token 已验证并保存。');
-    return;
-  }
-
-  if (command === 'register') {
-    const json = hasFlag(rawArgs, '--json');
-    const threadId = extractOption(rawArgs, '--thread');
-    const hookUrl = extractOption(rawArgs, '--hook-url');
-    const role = extractOption(rawArgs, '--role') ?? 'developer';
-    const label = extractOption(rawArgs, '--label');
-    const projects = extractAllOptions(rawArgs, '--project');
-    const mrIids = extractAllOptions(rawArgs, '--mr');
-    const config = await loadOrCreateConfig({ workspaceRoot, configPath });
-    const agent = await registerAgent({
-      workspaceRoot,
-      config,
-      threadId,
-      hookUrl,
-      role,
-      projects,
-      mrIids,
-      label,
+    await updateConfig(store, (latest) => {
+      if (host) {
+        const normalized = normalizeGitLabHost(host);
+        if (latest.projects.length && latest.gitlabHost && normalized !== latest.gitlabHost) {
+          throw new Error('已有项目时不能切换 GitLab host，请先删除项目');
+        }
+        latest.gitlabHost = normalized;
+      }
+      if (action === 'add') prepareProject(latest, { path, workspace });
+      else if (action === 'remove') {
+        if (!path || !latest.projects.some((project) => project.path === path)) throw new Error('项目不存在');
+        latest.projects = latest.projects.filter((project) => project.path !== path);
+      } else throw new Error('project 支持 add、remove、list');
     });
-
-    if (json) {
-      console.log(JSON.stringify(agent, null, 2));
-    } else {
-      console.log(`registered=${agent.id}`);
-      console.log(`role=${agent.role}`);
-      console.log(`projects=${agent.projects.join(',') || '*'}`);
-      console.log(`mrIids=${agent.mrIids.join(',') || '*'}`);
-      console.log(`threadId=${agent.threadId ?? '-'}`);
-      console.log(`hookUrl=${agent.hookUrl ?? '-'}`);
-    }
+    console.log(`project ${action}: ${path || workspace}`);
     return;
   }
-
+  if (command === 'auth') {
+    const host = normalizeGitLabHost(extractOption(args, '--host') || config.gitlabHost);
+    let token = extractOption(args, '--token');
+    if (hasFlag(args, '--token-stdin')) {
+      const chunks = [];
+      for await (const chunk of process.stdin) chunks.push(chunk);
+      token = Buffer.concat(chunks).toString('utf8').trim();
+    }
+    assertNoArguments(args);
+    if (!host) throw new Error('请使用 --host 配置 GitLab 地址');
+    if (!token) throw new Error('请使用 --token-stdin 或 --token 提供 Token');
+    const currentUser = await new TokenGitLabClient({ host, token }).currentUser();
+    await updateConfig(store, async (latest) => {
+      if (latest.projects.length && latest.gitlabHost && latest.gitlabHost !== host) {
+        throw new Error('已有项目时不能切换 GitLab host，请先删除项目');
+      }
+      await saveGitLabToken({ serviceHome, host, token });
+      latest.gitlabHost = host;
+    });
+    console.log(`gitlab=${host}\ncurrentUser=${currentUser}\nGitLab Token 已验证并保存。`);
+    return;
+  }
+  if (command === 'register') {
+    const json = hasFlag(args, '--json');
+    const params = {
+      serviceHome, config,
+      threadId: extractOption(args, '--thread'), hookUrl: extractOption(args, '--hook-url'),
+      role: extractOption(args, '--role') || 'developer', label: extractOption(args, '--label'),
+      projects: extractAllOptions(args, '--project'), mrIids: extractAllOptions(args, '--mr'),
+    };
+    assertNoArguments(args);
+    const agent = await registerAgent(params);
+    console.log(json ? JSON.stringify(agent, null, 2) : `registered=${agent.id}\nprojects=${agent.projects.join(',') || '*'}\nmrIids=${agent.mrIids.join(',') || '*'}`);
+    return;
+  }
   if (command === 'unregister') {
-    const id = extractOption(rawArgs, '--id');
-    const threadId = extractOption(rawArgs, '--thread');
-    if (!id && !threadId) {
-      throw new Error('unregister 需要 --id 或 --thread');
-    }
-    const removedCount = await unregisterAgent({ workspaceRoot, id, threadId });
-    console.log(`removed=${removedCount}`);
+    const id = extractOption(args, '--id');
+    const threadId = extractOption(args, '--thread');
+    assertNoArguments(args);
+    if (!id && !threadId) throw new Error('unregister 需要 --id 或 --thread');
+    console.log(`removed=${await unregisterAgent({ serviceHome, id, threadId })}`);
     return;
   }
-
   if (command === 'list') {
-    const json = hasFlag(rawArgs, '--json');
-    const agents = await listAgents(workspaceRoot);
-    if (json) {
-      console.log(JSON.stringify(agents, null, 2));
-      return;
-    }
-    if (agents.length === 0) {
-      console.log('没有已注册的 agent。');
-      return;
-    }
-    for (const agent of agents) {
-      console.log([
-        agent.id,
-        agent.role,
-        agent.label ?? '-',
-        `projects=${agent.projects.join(',') || '*'}`,
-        `mrs=${agent.mrIids.join(',') || '*'}`,
-        `thread=${agent.threadId ?? '-'}`,
-        `hook=${agent.hookUrl ?? '-'}`,
-      ].join(' | '));
-    }
+    hasFlag(args, '--json');
+    assertNoArguments(args);
+    console.log(JSON.stringify(await listAgents(serviceHome), null, 2));
     return;
   }
-
-  const watcherPath = resolve(packageRoot, 'watch.mjs');
-  const child = spawn(process.execPath, [watcherPath, ...rawArgs], {
-    cwd: workspaceRoot,
-    env: {
-      ...process.env,
-      MR_WATCH_WORKSPACE: workspaceRoot,
-      MR_WATCH_CONFIG: configPath,
-    },
+  const child = spawn(process.execPath, [resolve(packageRoot, 'watch.mjs'), ...args], {
+    cwd: serviceHome,
+    env: { ...process.env, MR_WATCH_HOME: serviceHome, MR_WATCH_CONFIG: configPath },
     stdio: 'inherit',
-    windowsHide: false,
   });
-
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-      return;
-    }
-    process.exit(code ?? 1);
-  });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
+  child.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
+  child.on('exit', (code) => { process.exitCode = code ?? 1; });
 }
-
-main().catch((error) => {
-  console.error(`mr-watch: ${error.message}`);
-  process.exit(1);
-});
+main().catch((error) => { console.error(`mr-watch: ${error.message}`); process.exitCode = 1; });

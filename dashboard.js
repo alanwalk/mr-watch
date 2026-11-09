@@ -243,6 +243,9 @@ function updateStatus(status, stats, auth) {
   if (hasError) {
     statusLabel.textContent = '有错误';
     liveLabel.textContent = '有错误';
+  } else if (stats.projectCount === 0) {
+    statusLabel.textContent = '暂无项目';
+    liveLabel.textContent = '暂无项目';
   } else if (needsAuthentication) {
     statusLabel.textContent = '待认证';
     liveLabel.textContent = '待认证';
@@ -267,6 +270,8 @@ function updateStatus(status, stats, auth) {
 
   if (hasError) {
     $('#sidebar-summary').textContent = `上一轮失败：${status.lastError}`;
+  } else if (stats.projectCount === 0) {
+    $('#sidebar-summary').textContent = '暂无项目，请在“项目管理”中添加项目。';
   } else if (needsAuthentication) {
     $('#sidebar-summary').textContent = 'GitLab 尚未连接，请在“接入设置”中粘贴 Token。';
   } else if (isPolling) {
@@ -376,6 +381,64 @@ function renderAgents(agents) {
   }).join('');
 }
 
+function renderProjects(projects) {
+  $('#project-count').textContent = `${projects.length} 个`;
+  $('#project-list').innerHTML = projects.length ? projects.map((project) => `
+    <div class="project-row">
+      <div><strong>${escapeHtml(project.path)}</strong><small>${escapeHtml(project.workspace || '仅 GitLab API 审查')}</small></div>
+      <button class="mini-btn" type="button" data-remove-project="${escapeHtml(project.path)}">删除</button>
+    </div>`).join('') : '<div class="empty-state">暂无项目。添加本地仓库或 GitLab 项目路径以开始轮询。</div>';
+}
+
+async function submitProject(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/projects', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: $('#project-path').value.trim(), workspace: $('#project-workspace').value.trim() || null }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDashboard(payload);
+    $('#project-form').reset();
+    showToast('项目已添加');
+  } catch (error) { showToast(`添加失败：${error.message}`); }
+  finally { button.disabled = false; }
+}
+
+async function removeProject(event) {
+  const button = event.target.closest('[data-remove-project]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/projects?path=${encodeURIComponent(button.dataset.removeProject)}`, { method: 'DELETE' });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDashboard(payload);
+    showToast('项目已删除');
+  } catch (error) { showToast(`删除失败：${error.message}`); button.disabled = false; }
+}
+
+function updateTokenSettingsLink() {
+  let href = '';
+  try {
+    const host = new URL($('#auth-host').value.trim());
+    if (['http:', 'https:'].includes(host.protocol) && !host.username && !host.password
+        && host.pathname === '/' && !host.search && !host.hash) {
+      const url = new URL('/-/user_settings/personal_access_tokens', host);
+      url.searchParams.set('name', 'mr-watch');
+      url.searchParams.set('scopes', 'read_api');
+      href = url.href;
+    }
+  } catch { /* Wait for a complete host URL. */ }
+  const link = $('#token-settings-link');
+  link.href = href || '#';
+  link.classList.toggle('disabled', !href);
+  link.setAttribute('aria-disabled', href ? 'false' : 'true');
+}
+
 function renderAuth(auth) {
   const authStatus = auth || {};
   const authenticated = Boolean(authStatus.authenticated);
@@ -391,7 +454,6 @@ function renderAuth(auth) {
   const authUser = $('#auth-user');
   const authSummary = $('#auth-summary');
   const authRemote = $('#auth-remote');
-  const tokenSettingsLink = $('#token-settings-link');
   const tokenInput = $('#auth-token');
   const authSubmit = $('#auth-submit');
 
@@ -413,16 +475,18 @@ function renderAuth(auth) {
   } else {
     authUser.textContent = '等待 GitLab 接入';
     authSummary.textContent = managedByEnvironment
-      ? '环境变量 GITLAB_TOKEN 未能通过验证；可以粘贴新 Token 临时接入。'
-      : '已从 workspace 的 origin remote 自动解析，无需再填写 GitLab 地址。';
+      ? '使用环境变量 GITLAB_TOKEN 验证此服务地址；Token 无效时请更新环境变量并重启。'
+      : '填写服务 GitLab 地址，或添加本地仓库以自动补全。';
   }
 
-  authRemote.textContent = remoteUrl || '无法解析 origin remote';
+  authRemote.textContent = remoteUrl || '尚未配置 GitLab host';
+  const hostInput = $('#auth-host');
+  if (document.activeElement !== hostInput && hostInput.dataset.savedHost !== authStatus.host) {
+    hostInput.value = authStatus.host || '';
+    hostInput.dataset.savedHost = authStatus.host || '';
+  }
   authRemote.title = remoteUrl || '';
-  const tokenSettingsUrl = safeHttpUrl(authStatus.tokenSettingsUrl);
-  tokenSettingsLink.href = tokenSettingsUrl || '#';
-  tokenSettingsLink.classList.toggle('disabled', !tokenSettingsUrl);
-  tokenSettingsLink.setAttribute('aria-disabled', tokenSettingsUrl ? 'false' : 'true');
+  updateTokenSettingsLink();
 
   if (environmentLocked) {
     tokenInput.disabled = true;
@@ -430,10 +494,10 @@ function renderAuth(auth) {
     authSubmit.disabled = true;
     authSubmit.textContent = '环境变量已接管';
   } else {
-    tokenInput.disabled = false;
+    tokenInput.disabled = managedByEnvironment;
     tokenInput.placeholder = 'glpat-...';
     authSubmit.disabled = false;
-    authSubmit.textContent = authenticated ? '更新 Token' : '保存并验证';
+    authSubmit.textContent = managedByEnvironment ? '验证环境变量' : authenticated ? '更新 Token' : '保存并验证';
   }
 }
 
@@ -549,11 +613,11 @@ function renderDashboard(data) {
   const status = data.status || {};
   const config = data.config || {};
   const projects = Array.isArray(config.projects) ? config.projects : [];
-  const projectLabel = projects.length > 0 ? projects.join(', ') : '未配置项目';
+  const projectLabel = projects.length > 0 ? projects.map((project) => project.path).join(', ') : '暂无项目';
 
   $('#project-pill').textContent = projectLabel;
-  $('#flow-project').textContent = projects[0] || '未配置项目';
-  $('#orbit-project').textContent = projects[0] || '未配置项目';
+  $('#flow-project').textContent = projectLabel;
+  $('#orbit-project').textContent = projectLabel;
   $('#flow-thread-count').textContent = String(stats.mappingCount ?? 0);
   $('#orbit-review-count').textContent = `${stats.mappingCount ?? 0} mapped`;
   const appServerLabel = config.appServerUrl
@@ -571,6 +635,7 @@ function renderDashboard(data) {
   });
   renderMappings(data.mappings);
   renderAgents(data.agents);
+  renderProjects(projects);
   renderAuth(data.auth);
   renderActive(data.activeMergeRequests);
   renderHistory(data.events);
@@ -656,7 +721,7 @@ async function submitGitLabAuth(event) {
   const tokenInput = $('#auth-token');
   const authSubmit = $('#auth-submit');
   const token = tokenInput.value.trim();
-  if (!token) {
+  if (!token && !dashboardState.data?.auth?.managedByEnvironment) {
     showToast('请先粘贴 GitLab Personal Access Token');
     tokenInput.focus();
     return;
@@ -669,7 +734,7 @@ async function submitGitLabAuth(event) {
     const response = await fetch('/api/auth/gitlab', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, host: $('#auth-host').value.trim() }),
     });
     const payload = await response.json();
     if (!response.ok) {
@@ -731,6 +796,9 @@ function setHistoryFilter(filter) {
 function bindEvents() {
   $('#refresh-btn').addEventListener('click', refreshDashboard);
   $('#auth-form').addEventListener('submit', submitGitLabAuth);
+  $('#auth-host').addEventListener('input', updateTokenSettingsLink);
+  $('#project-form').addEventListener('submit', submitProject);
+  $('#project-list').addEventListener('click', removeProject);
   $('#toggle-token').addEventListener('click', toggleAuthTokenVisibility);
   $('#copy-auth-remote').addEventListener('click', () => {
     copyText($('#auth-remote').textContent);

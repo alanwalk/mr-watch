@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 
 import {
-  inferGitLabHost,
+  normalizeGitLabHost,
   resolveGitLabToken,
 } from './workspace.mjs';
 
@@ -19,6 +19,7 @@ function runCommand(command, args, cwd) {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 20 * 1024 * 1024,
+      timeout: REQUEST_TIMEOUT_MS,
     }).trim();
   } catch (error) {
     const stderr = error.stderr ? String(error.stderr).trim() : '';
@@ -115,9 +116,10 @@ export class TokenGitLabClient {
 }
 
 class GlabGitLabClient {
-  constructor({ cwd }) {
+  constructor({ cwd, host }) {
     this.mode = 'glab';
     this.cwd = cwd;
+    this.host = host;
   }
 
   runJson(args) {
@@ -130,7 +132,7 @@ class GlabGitLabClient {
   }
 
   async currentUser() {
-    const user = this.runJson(['api', 'user']);
+    const user = this.runJson(['api', '--hostname', new URL(this.host).host, 'user']);
     if (!user?.username) {
       throw new Error('GitLab /user 没有返回 username');
     }
@@ -142,7 +144,7 @@ class GlabGitLabClient {
       'mr',
       'list',
       '-R',
-      project,
+      `${this.host}/${project}`,
       '--output',
       'json',
       '--per-page',
@@ -158,7 +160,7 @@ class GlabGitLabClient {
       'view',
       String(mergeRequestIid),
       '-R',
-      project,
+      `${this.host}/${project}`,
       '--comments',
       '--output',
       'json',
@@ -166,12 +168,12 @@ class GlabGitLabClient {
   }
 }
 
-export async function createGitLabClient({ workspaceRoot, config }) {
-  const host = normalizeHost(config.gitlabHost || inferGitLabHost(workspaceRoot));
-  const token = await resolveGitLabToken(workspaceRoot, host);
-  if (token) {
-    return new TokenGitLabClient({ host, token });
-  }
-
-  return new GlabGitLabClient({ cwd: workspaceRoot });
+export async function createGitLabClient({ serviceHome, config, project = null }) {
+  const host = normalizeGitLabHost(config.gitlabHost);
+  if (!host) return null;
+  const token = await resolveGitLabToken(serviceHome, host);
+  if (token) return new TokenGitLabClient({ host, token });
+  // glab is only meaningful in this project's repository, never in the launch cwd.
+  if (!project?.workspace) return null;
+  return new GlabGitLabClient({ cwd: project.workspace, host });
 }

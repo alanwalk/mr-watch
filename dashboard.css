@@ -2045,3 +2045,14 @@ h3 {
     transition-duration: 0.01ms !important;
   }
 }
+
+
+.projects-panel { grid-column: 1 / -1; }
+.project-form { display: grid; gap: 12px; padding: 20px; }
+.project-form label { display: grid; gap: 8px; font-size: 13px; }
+.project-form input { width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
+.project-form button { justify-self: start; }
+.project-form p { font-size: 12px; opacity: .7; }
+.project-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; }
+.project-row div { min-width: 0; overflow-wrap: anywhere; }
+.project-row small { display: block; margin-top: 6px; opacity: .7; }

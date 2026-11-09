@@ -28,6 +28,9 @@
         <a class="nav-item" href="#agents">
           <span class="nav-icon">◎</span><span>注册会话</span>
         </a>
+        <a class="nav-item" href="#projects">
+          <span class="nav-icon">▤</span><span>项目管理</span>
+        </a>
         <a class="nav-item" href="#settings">
           <span class="nav-icon">⚙</span><span>接入设置</span>
         </a>
@@ -60,7 +63,7 @@
     <main class="main">
       <header class="topbar">
         <div>
-          <div class="breadcrumb"><span>workspace</span><span>/</span><span>MR 自动跟进</span></div>
+          <div class="breadcrumb"><span>mr-watch</span><span>/</span><span>MR 自动跟进</span></div>
           <div class="title-row">
             <h1>审查分配</h1>
             <span class="live-pill" id="live-pill"><span class="live-dot"></span><span id="live-label">实时</span></span>
@@ -212,6 +215,20 @@
         </div>
       </section>
 
+      <section class="panel projects-panel" id="projects">
+        <div class="panel-head">
+          <div><div class="eyebrow">PROJECTS</div><h3>项目管理</h3></div>
+          <span class="soft-badge" id="project-count">0 个</span>
+        </div>
+        <div id="project-list" class="agent-list"></div>
+        <form id="project-form" class="project-form">
+          <label>GitLab 项目路径<input id="project-path" placeholder="team/project（填写 workspace 后可从 origin 推断）" autocomplete="off"></label>
+          <label>本地 workspace（可选）<input id="project-workspace" placeholder="本地绝对路径；留空则仅使用 GitLab API" autocomplete="off"></label>
+          <button class="primary-btn" type="submit">添加项目</button>
+          <p>添加或删除后立即生效。未配置 GitLab host 时，可从项目仓库的 origin 自动补全。</p>
+        </form>
+      </section>
+
       <section class="panel settings-panel" id="settings">
         <div class="panel-head">
           <div><div class="eyebrow">GITLAB ACCESS</div><h3>接入设置</h3></div>
@@ -226,9 +243,9 @@
               <span class="auth-glyph">G</span>
             </div>
             <div class="auth-copy">
-              <div class="auth-kicker">WORKSPACE REMOTE</div>
-              <strong id="auth-user">正在读取 Git remote...</strong>
-              <p id="auth-summary">GitLab 地址会从当前 workspace 的 origin 自动解析。</p>
+              <div class="auth-kicker">SERVICE GITLAB</div>
+              <strong id="auth-user">正在读取服务配置...</strong>
+              <p id="auth-summary">填写服务 GitLab 地址，或添加本地仓库以自动补全。</p>
               <div class="auth-remote-row">
                 <code id="auth-remote">--</code>
                 <button class="mini-btn" id="copy-auth-remote" type="button">复制</button>
@@ -244,6 +261,8 @@
               </div>
               <span class="auth-scope">read_api</span>
             </div>
+            <label class="token-label" for="auth-host">GitLab 地址</label>
+            <div class="token-input-wrap"><input id="auth-host" type="url" placeholder="https://git.example.com" autocomplete="url"></div>
             <label class="token-label" for="auth-token">GitLab Token</label>
             <div class="token-input-wrap">
               <input id="auth-token" type="password" placeholder="glpat-..." autocomplete="new-password" spellcheck="false">
@@ -255,7 +274,7 @@
               </a>
               <button class="ghost-btn auth-verify-btn" id="auth-submit" type="submit">保存并验证</button>
             </div>
-            <p class="auth-hint">点击左侧按钮会打开当前 GitLab 的 Token 创建页。保存前会调用 <code>/api/v4/user</code> 验证，Token 仅写入本机 <code>.mr-watch/credentials.json</code>，页面不会回显。</p>
+            <p class="auth-hint">点击左侧按钮会打开当前 GitLab 的 Token 创建页。保存前会调用 <code>/api/v4/user</code> 验证，Token 仅写入本机 <code>~/.config/mr-watch/credentials.json（或指定的服务目录）</code>，页面不会回显。</p>
           </form>
         </div>
       </section>

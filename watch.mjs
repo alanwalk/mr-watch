@@ -1,9 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { watch as watchDirectory } from 'node:fs';
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
-import { dirname, resolve } from 'node:path';
-import { createInterface } from 'node:readline/promises';
-import { stdin, stdout } from 'node:process';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createAppServerClient } from './app-server-client.mjs';
@@ -12,9 +11,17 @@ import {
   getConfigPath,
   getDataDir,
   getGitLabCredentialInfo,
-  inferGitLabRemote,
+  getEventLogPath,
+  buildGitLabTokenSettingsUrl,
+  normalizeGitLabHost,
+  normalizeProjects,
+  getProjectPath,
+  getProjectWorkspace,
+  prepareProject,
+  resolveGitLabToken,
+  updateConfig,
   loadOrCreateConfig,
-  resolveWorkspaceRoot,
+  resolveServiceHome,
   saveGitLabToken,
 } from './src/workspace.mjs';
 import {
@@ -27,15 +34,13 @@ import {
 } from './src/gitlab-client.mjs';
 
 const packageRoot = dirname(fileURLToPath(import.meta.url));
-const workspaceRoot = resolveWorkspaceRoot(process.env.MR_WATCH_WORKSPACE ?? process.cwd());
-const repoRoot = workspaceRoot;
-const configPath = getConfigPath(workspaceRoot, process.env.MR_WATCH_CONFIG);
-const dataDir = getDataDir(workspaceRoot);
+const serviceHome = resolveServiceHome();
+const configPath = getConfigPath(serviceHome, process.env.MR_WATCH_CONFIG);
+const dataDir = getDataDir(serviceHome);
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 const MIN_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_DASHBOARD_PORT = 8787;
 const DEFAULT_DASHBOARD_HOST = '127.0.0.1';
-const DEFAULT_WATCH_EVENT_LOG_PATH = './events.jsonl';
 const MAX_NOTE_PREVIEW = 400;
 const MAX_NOTES_IN_MESSAGE = 5;
 const AGENT_NOTE_MARKERS = [
@@ -223,26 +228,17 @@ function parseArguments(argv) {
     throw new Error(`--dashboard-port 必须是 1 到 65535 之间的整数，当前值: ${options.dashboardPort}`);
   }
 
-  if (options.notify !== null && (!Number.isInteger(Number(options.notify)) || Number(options.notify) <= 0)) {
-    throw new Error(`--notify 必须是有效的 MR IID，当前值: ${options.notify}`);
+  if (options.notify !== null && !/^(?:[^!]+!)?[1-9]\d*$/.test(options.notify)) {
+    throw new Error('--notify 必须是 project/path!IID 或有效的 MR IID');
   }
 
   return options;
 }
 
 function validateConfig(config) {
-  if (!Array.isArray(config.projects) || config.projects.length === 0) {
-    throw new Error('config.json 的 projects 必须是非空数组');
-  }
-
-  config.projects = config.projects
-    .map((project) => String(project).trim().replace(/^\/+|\/+$/g, ''))
-    .filter((project) => project.length > 0);
-
-  if (config.projects.length === 0) {
-    throw new Error('config.json 没有有效项目路径');
-  }
-
+  if (config.version !== 2) throw new Error('config.json 需要 version: 2');
+  config.projects = normalizeProjects(config.projects);
+  config.gitlabHost = normalizeGitLabHost(config.gitlabHost);
   if (config.reviewThreads === null || typeof config.reviewThreads !== 'object' || Array.isArray(config.reviewThreads)) {
     config.reviewThreads = {};
   }
@@ -275,11 +271,8 @@ function validateConfig(config) {
     config.dashboardHost = DEFAULT_DASHBOARD_HOST;
   }
 
-  const watchEventLogPath = typeof config.watchEventLogPath === 'string'
-    ? config.watchEventLogPath.trim()
-    : '';
-  config.watchEventLogPath = watchEventLogPath || DEFAULT_WATCH_EVENT_LOG_PATH;
-  config.watchEventLogPathResolved = resolve(dataDir, config.watchEventLogPath);
+  config.watchEventLogPath = 'events.jsonl';
+  config.watchEventLogPathResolved = getEventLogPath(serviceHome);
   config.appServerUrl = typeof config.appServerUrl === 'string' && config.appServerUrl.trim().length > 0
     ? config.appServerUrl.trim()
     : DEFAULT_APP_SERVER_URL;
@@ -294,7 +287,7 @@ function validateConfig(config) {
 }
 
 async function loadConfigFromDisk() {
-  const config = await loadOrCreateConfig({ workspaceRoot, configPath });
+  const config = await loadOrCreateConfig({ serviceHome, configPath });
   return validateConfig(config);
 }
 
@@ -312,83 +305,41 @@ async function loadConfigSafely() {
   }
 }
 
-async function saveConfig(config) {
-  const persistedConfig = { ...config };
-  delete persistedConfig.watchEventLogPathResolved;
-  const temporaryPath = `${configPath}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(persistedConfig, null, 2)}\n`, 'utf8');
-  await rename(temporaryPath, configPath);
-}
-
-function createPrompt() {
-  return createInterface({ input: stdin, output: stdout });
-}
-
-async function resolveRole(options) {
-  if (options.notify !== null) {
-    return 'developer';
+function applyOptions(config, options, strict = false) {
+  const effective = { ...config };
+  for (const key of ['appServerUrl', 'reviewModel', 'reviewEffort', 'dashboardHost']) {
+    if (options[key] !== null) effective[key] = options[key];
   }
-
-  if (options.role) {
-    return options.role;
-  }
-
-  if (!stdin.isTTY) {
-    throw new Error('未指定角色且当前不是交互终端，请使用 --role reviewer 或 --role developer');
-  }
-
-  const prompt = createPrompt();
-  try {
-    const answer = await prompt.question(
-      '选择运行角色：1=审核端 reviewer，2=普通开发者 developer [1]: ',
-    );
-    return answer.trim() === '2' ? 'developer' : 'reviewer';
-  } finally {
-    prompt.close();
-  }
-}
-
-async function resolveThreadId(config, role, options) {
-  if (role === 'reviewer') {
-    return null;
-  }
-
-  if (options.thread) {
-    return options.thread;
-  }
-
-  const configKey = 'developerThreadId';
-  const configuredThreadId = config[configKey];
-  if (typeof configuredThreadId === 'string' && configuredThreadId.trim().length > 0) {
-    return configuredThreadId.trim();
-  }
-
-  if (!stdin.isTTY) {
-    throw new Error(`${configKey} 未配置，且当前不是交互终端`);
-  }
-
-  const prompt = createPrompt();
-  try {
-    const answer = await prompt.question(
-      '请输入接收“继续处理”消息的 Codex thread UUID: ',
-    );
-    const threadId = answer.trim();
-    if (threadId.length === 0) {
-      throw new Error('未输入 thread UUID');
+  if (options.projectRefs.length) {
+    if (strict) {
+      const missing = options.projectRefs.find((path) => !config.projects.some((item) => item.path === path));
+      if (missing) throw new Error(`项目未配置: ${missing}`);
     }
-
-    config[configKey] = threadId;
-    await saveConfig(config);
-    return threadId;
-  } finally {
-    prompt.close();
+    effective.projects = config.projects.filter((project) => options.projectRefs.includes(project.path));
   }
+  return effective;
+}
+
+async function mutateConfig(mutate) {
+  const result = await updateConfig({ serviceHome, configPath }, (config) => {
+    validateConfig(config);
+    delete config.watchEventLogPathResolved;
+    return mutate(config);
+  });
+  lastGoodConfig = await loadConfigFromDisk();
+  return result;
+}
+
+async function resolveRole(options, config) {
+  const role = options.notify !== null ? 'developer' : options.role || config.role || 'reviewer';
+  if (!['reviewer', 'developer'].includes(role)) throw new Error('role 只支持 reviewer 或 developer');
+  return role;
 }
 
 function runCommand(command, args) {
   try {
     return execFileSync(command, args, {
-      cwd: repoRoot,
+      cwd: serviceHome,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 20 * 1024 * 1024,
@@ -536,10 +487,7 @@ function getReviewThreadId(config, project, mergeRequestIid) {
 
 async function persistReviewThreadMapping(config, project, mergeRequestIid, threadId) {
   const mappingKey = `${project}!${mergeRequestIid}`;
-  const latestConfig = await loadConfigFromDisk();
-  latestConfig.reviewThreads[mappingKey] = threadId;
-  await saveConfig(latestConfig);
-  lastGoodConfig = latestConfig;
+  await mutateConfig((latest) => { latest.reviewThreads[mappingKey] = threadId; });
   config.reviewThreads[mappingKey] = threadId;
 }
 
@@ -547,9 +495,12 @@ function buildReviewThreadTitle(project, mergeRequest) {
   return `代码审查 | ${project} !${mergeRequest.iid}`;
 }
 
-function buildReviewPrompt(project, mergeRequest) {
+function buildReviewPrompt(project, mergeRequest, projectConfig) {
   return [
     `你是独立审查线程，审查 GitLab MR !${mergeRequest.iid}（${project}）。`,
+    projectConfig.workspace
+      ? `本地仓库: ${projectConfig.workspace}。本地文件核对仅限此项目目录。`
+      : '此项目未配置 workspace。只能使用 GitLab API 审查；当前 cwd 是服务目录，不是项目仓库，不得读取本地项目文件进行核对。',
     `标题: ${mergeRequest.title ?? '(无标题)'}`,
     `作者: ${mergeRequest.author?.username ?? 'unknown'}`,
     `分支: ${mergeRequest.source_branch ?? '?'} -> ${mergeRequest.target_branch ?? '?'}`,
@@ -693,7 +644,7 @@ async function notifyRegisteredAgents(
 ) {
   let agents;
   try {
-    agents = await listAgents(workspaceRoot);
+    agents = await listAgents(serviceHome);
   } catch (error) {
     console.error(`读取 agent 注册表失败: ${error.message}`);
     return 0;
@@ -904,7 +855,8 @@ async function pollReviewer(config, state, runtime, options) {
   let queuedCount = 0;
   let checkedCount = 0;
 
-  for (const project of config.projects) {
+  for (const projectConfig of config.projects) {
+    const project = getProjectPath(projectConfig);
     const openMergeRequests = await listAllOpenMergeRequests(runtime.gitlab, project);
 
     for (const listMergeRequest of openMergeRequests) {
@@ -930,12 +882,13 @@ async function pollReviewer(config, state, runtime, options) {
             if (options.dryRun) {
               console.log('\n[DRY-RUN] 将创建审查线程');
               console.log(buildReviewThreadTitle(project, mergeRequest));
-              console.log(buildReviewPrompt(project, mergeRequest));
+              console.log(buildReviewPrompt(project, mergeRequest, projectConfig));
               console.log('');
             } else {
               const createdThread = await runtime.appServer.createReviewThread({
+                cwd: getProjectWorkspace(projectConfig) ?? serviceHome,
                 title: buildReviewThreadTitle(project, mergeRequest),
-                prompt: buildReviewPrompt(project, mergeRequest),
+                prompt: buildReviewPrompt(project, mergeRequest, projectConfig),
                 developerInstructions: REVIEW_THREAD_INSTRUCTIONS,
                 model: config.reviewModel,
                 effort: config.reviewEffort,
@@ -998,12 +951,13 @@ async function pollReviewer(config, state, runtime, options) {
           if (options.dryRun) {
             console.log('\n[DRY-RUN] MR 缺少映射，将创建审查线程');
             console.log(buildReviewThreadTitle(project, mergeRequest));
-            console.log(buildReviewPrompt(project, mergeRequest));
+            console.log(buildReviewPrompt(project, mergeRequest, projectConfig));
             console.log('');
           } else {
             const createdThread = await runtime.appServer.createReviewThread({
+              cwd: getProjectWorkspace(projectConfig) ?? serviceHome,
               title: buildReviewThreadTitle(project, mergeRequest),
-              prompt: buildReviewPrompt(project, mergeRequest),
+              prompt: buildReviewPrompt(project, mergeRequest, projectConfig),
               developerInstructions: REVIEW_THREAD_INSTRUCTIONS,
               model: config.reviewModel,
               effort: config.reviewEffort,
@@ -1094,7 +1048,8 @@ async function pollDeveloper(config, state, runtime, options) {
   let checkedCount = 0;
   const configuredIids = config.developer.watchMergeRequests.map((iid) => Number(iid));
 
-  for (const project of config.projects) {
+  for (const projectConfig of config.projects) {
+    const project = getProjectPath(projectConfig);
     const openMergeRequests = await listAllOpenMergeRequests(runtime.gitlab, project);
     const watchedMergeRequests = configuredIids.length > 0
       ? openMergeRequests.filter((mergeRequest) => configuredIids.includes(Number(mergeRequest.iid)))
@@ -1129,7 +1084,7 @@ async function pollDeveloper(config, state, runtime, options) {
         const newNotesText = formatNewNotes(watchedNotes, previousState.latestWatchedNoteId);
         if (shouldNotifyDeveloper(previousState, mergeRequest, newNotesText)) {
           const message = buildDeveloperMessage(project, mergeRequest, previousState, newNotesText);
-          await queueThreadMessage(runtime.developerThreadId, message, options);
+          const notifiedThreads = await deliverDeveloperMessage(project, mergeRequest, message, runtime, options);
           queuedCount += 1;
 
           if (!options.dryRun) {
@@ -1140,7 +1095,7 @@ async function pollDeveloper(config, state, runtime, options) {
               mrIid: Number(mergeRequest.iid),
               title: mergeRequest.title ?? null,
               headSha: mergeRequest.sha ?? null,
-              threadId: runtime.developerThreadId,
+              threadId: notifiedThreads[0] ?? null,
               summary: newNotesText.length > 0
                 ? 'MR 有新审查意见，已通知开发 agent'
                 : 'MR 的 CI 或合并状态需要处理，已通知开发 agent',
@@ -1177,41 +1132,126 @@ async function pollDeveloper(config, state, runtime, options) {
   );
 }
 
+async function refreshRuntime(config, runtime) {
+  const token = config.gitlabHost ? await resolveGitLabToken(serviceHome, config.gitlabHost) : null;
+  const key = JSON.stringify([config.gitlabHost, token, config.projects]);
+  if (runtime.clientKey !== key) {
+    runtime.clientKey = key;
+    runtime.authHost = config.gitlabHost;
+    runtime.authErrors = [];
+    runtime.clients = new Map();
+    runtime.currentUser = null;
+    runtime.gitlab = null;
+    let tokenClient = null;
+    let tokenUser = null;
+    if (config.gitlabHost && token) {
+      tokenClient = new TokenGitLabClient({ host: config.gitlabHost, token });
+      try { tokenUser = await tokenClient.currentUser(); } catch (error) {
+        runtime.authErrors.push(error.message);
+      }
+      runtime.gitlab = tokenClient;
+      runtime.currentUser = tokenUser;
+    }
+    for (const project of config.projects) {
+      const gitlab = tokenClient || await createGitLabClient({ serviceHome, config, project });
+      if (!gitlab) continue;
+      try {
+        const currentUser = tokenClient ? tokenUser : await gitlab.currentUser();
+        if (!currentUser) continue;
+        runtime.clients.set(project.path, { gitlab, currentUser });
+        runtime.currentUser ||= currentUser;
+        runtime.gitlab ||= gitlab;
+      } catch (error) {
+        runtime.authErrors.push(`${project.path}: ${error.message}`);
+        console.error(`[${project.path}] GitLab 认证失败: ${error.message}`);
+      }
+    }
+  }
+  if (runtime.authErrors?.length) runtime.clientKey = null;
+  if (runtime.appServer?.url !== config.appServerUrl) {
+    runtime.appServer?.close();
+    runtime.appServer = createAppServerClient({ url: config.appServerUrl, cwd: serviceHome });
+  }
+  runtime.developerThreadId = runtime.options.thread || config.developerThreadId || null;
+}
+
+async function deliverDeveloperMessage(project, mergeRequest, message, runtime, options) {
+  const agents = (await listAgents(serviceHome)).filter((agent) =>
+    agent.role === 'developer' && agentMatches(agent, project, mergeRequest.iid));
+  if (!agents.length) {
+    if (!runtime.developerThreadId) throw new Error(`项目 ${project} 没有匹配的 developer agent 或默认 thread`);
+    await queueThreadMessage(runtime.developerThreadId, message, options);
+    return [runtime.developerThreadId];
+  }
+  const sent = new Set();
+  for (const agent of agents) {
+    if (agent.threadId && !sent.has(agent.threadId)) {
+      await queueThreadMessage(agent.threadId, message, options);
+      sent.add(agent.threadId);
+    }
+    if (agent.hookUrl) {
+      if (options.dryRun) console.log(`[DRY-RUN] POST hook ${agent.hookUrl}\n${message}`);
+      else await postAgentHook(agent, {
+        event: 'developer_notify', project, mrIid: Number(mergeRequest.iid), message,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+  return [...sent];
+}
+
 async function pollOnce(role, state, runtime, options) {
-  const config = await loadConfigSafely();
-  const intervalMs = options.intervalMs ?? config.pollIntervalMs;
-
-  if (role === 'reviewer') {
-    await pollReviewer(config, state, runtime, options);
-  } else {
-    await pollDeveloper(config, state, runtime, options);
+  const config = applyOptions(await loadConfigSafely(), options);
+  await refreshRuntime(config, runtime);
+  const errors = [...(runtime.authErrors || [])];
+  for (const project of config.projects) {
+    try {
+      // Re-read between projects so removals take effect even during a long poll.
+      const latest = applyOptions(await loadConfigSafely(), options);
+      const active = latest.projects.find((item) => item.path === project.path);
+      if (!active) continue;
+      const client = runtime.clients.get(project.path);
+      if (!client) continue;
+      const projectRuntime = {
+        ...runtime, ...client,
+        ignoredAuthors: new Set([client.currentUser, ...latest.ignoreAuthors]),
+      };
+      const projectConfig = { ...latest, projects: [active] };
+      if (role === 'reviewer') await pollReviewer(projectConfig, state, projectRuntime, options);
+      else await pollDeveloper(projectConfig, state, projectRuntime, options);
+    } catch (error) {
+      errors.push(`${project.path}: ${error.message}`);
+      console.error(`[${project.path}] ${error.message}`);
+      await recordWatchEventSafely(config, {
+        role, type: 'error', level: 'error', project: project.path, summary: error.message,
+      });
+    }
   }
-
-  if (!options.dryRun) {
-    await saveState(getStatePath(role), state);
-  }
-
-  return intervalMs;
+  runtimeStatus.lastError = errors.join('; ') || null;
+  if (!options.dryRun) await saveState(getStatePath(role), state);
+  return options.intervalMs ?? config.pollIntervalMs;
 }
 
 async function notifyOnce(config, runtime, options) {
-  const project = runtime.project ?? config.projects[0];
-  const mergeRequest = await runtime.gitlab.viewMergeRequest(project, Number(options.notify));
-  const message = buildManualDeveloperMessage(project, mergeRequest);
-  await queueThreadMessage(runtime.developerThreadId, message, options);
-
-  if (!options.dryRun) {
-    await recordWatchEventSafely(config, {
-      role: 'developer',
-      type: 'developer_manual',
-      project,
-      mrIid: Number(mergeRequest.iid),
-      title: mergeRequest.title ?? null,
-      headSha: mergeRequest.sha ?? null,
-      threadId: runtime.developerThreadId,
-      summary: '用户手动通知开发 agent 继续处理',
-    });
-  }
+  await refreshRuntime(config, runtime);
+  const parts = options.notify.split('!');
+  let project;
+  const iid = Number(parts.at(-1));
+  if (parts.length === 2) project = parts[0];
+  else if (config.projects.length === 1) project = getProjectPath(config.projects[0]);
+  else throw new Error('多项目或零项目下纯 IID 必须同时指定 --project，或使用 project/path!IID');
+  if (!config.projects.some((item) => item.path === project)) throw new Error(`项目未配置: ${project}`);
+  const client = runtime.clients.get(project);
+  if (!client) throw new Error(`项目 ${project} 尚未认证或未配置 GitLab host`);
+  const mergeRequest = await client.gitlab.viewMergeRequest(project, iid);
+  const notifiedThreads = await deliverDeveloperMessage(project, mergeRequest,
+    buildManualDeveloperMessage(project, mergeRequest), runtime, options);
+  if (!options.dryRun) await recordWatchEventSafely(config, {
+    role: 'developer', type: 'developer_manual', project, mrIid: iid,
+    threadId: notifiedThreads[0] ?? null,
+    title: mergeRequest.title ?? null, headSha: mergeRequest.sha ?? null,
+    summary: '用户手动通知开发 agent 继续处理',
+  });
 }
 
 function buildMappingRows(config) {
@@ -1234,79 +1274,68 @@ function buildMappingRows(config) {
 }
 
 async function buildGitLabAuthState(context) {
-  const credentialInfo = await getGitLabCredentialInfo(
-    workspaceRoot,
-    context.gitlabInfo.host,
-  );
-
+  const config = await loadConfigSafely();
+  const host = config.gitlabHost;
+  const credentialInfo = await getGitLabCredentialInfo(serviceHome, host);
+  const authenticated = Boolean(context.runtime.currentUser) && context.runtime.authHost === host;
   return {
-    authenticated: Boolean(context.runtime.currentUser),
-    currentUser: context.runtime.currentUser,
+    authenticated,
+    currentUser: authenticated ? context.runtime.currentUser : null,
     mode: context.runtime.gitlab?.mode ?? 'none',
-    host: context.gitlabInfo.host,
-    project: context.gitlabInfo.project,
-    webUrl: context.gitlabInfo.webUrl,
-    tokenSettingsUrl: context.gitlabInfo.tokenSettingsUrl,
+    host, webUrl: host,
+    tokenSettingsUrl: host ? buildGitLabTokenSettingsUrl(host) : null,
     credentialsSource: credentialInfo.source,
     credentialsUpdatedAt: credentialInfo.updatedAt,
     managedByEnvironment: credentialInfo.source === 'environment',
-    needsAuthentication: !context.runtime.currentUser,
+    needsAuthentication: !authenticated,
   };
 }
 
-async function authenticateGitLab(context, token) {
-  if (typeof token !== 'string' || token.trim().length === 0) {
-    throw new Error('Token 不能为空');
-  }
-  if (token.length > 4096) {
-    throw new Error('Token 长度异常');
-  }
-
-  const normalizedToken = token.trim();
-  const host = context.gitlabInfo.host;
-  const gitlab = new TokenGitLabClient({
-    host,
-    token: normalizedToken,
-  });
-  const currentUser = await gitlab.currentUser();
-  await saveGitLabToken({
-    workspaceRoot,
-    host,
-    token: normalizedToken,
-  });
-
+async function authenticateGitLab(context, token, hostInput) {
+  const environmentToken = process.env.GITLAB_TOKEN?.trim();
+  const effectiveToken = environmentToken || token;
+  if (typeof effectiveToken !== 'string' || !effectiveToken.trim() || effectiveToken.length > 4096) throw new Error('Token 为空或长度异常');
   const config = await loadConfigFromDisk();
-  context.runtime.gitlab = gitlab;
+  const host = normalizeGitLabHost(hostInput || config.gitlabHost);
+  if (!host) throw new Error('请先配置 GitLab host');
+  if (config.projects.length && config.gitlabHost && host !== config.gitlabHost) {
+    throw new Error('已有项目时不能切换 GitLab host，请先删除项目');
+  }
+  const gitlab = new TokenGitLabClient({ host, token: effectiveToken.trim() });
+  const currentUser = await gitlab.currentUser();
+  await mutateConfig(async (latest) => {
+    if (latest.projects.length && latest.gitlabHost && host !== latest.gitlabHost) throw new Error('项目 host 已变更，请重试');
+    if (!environmentToken) await saveGitLabToken({ serviceHome, host, token: effectiveToken });
+    latest.gitlabHost = host;
+  });
+  context.runtime.clientKey = null;
   context.runtime.currentUser = currentUser;
-  context.runtime.ignoredAuthors = new Set([
-    currentUser,
-    ...config.ignoreAuthors
-      .map((author) => String(author).trim())
-      .filter((author) => author.length > 0),
-  ]);
+  context.runtime.gitlab = gitlab;
+  context.runtime.authHost = host;
   context.runtime.authVersion += 1;
   runtimeStatus.lastError = null;
-
   await recordWatchEventSafely(config, {
-    role: context.role,
-    type: 'gitlab_authenticated',
+    role: context.role, type: 'gitlab_authenticated',
     summary: `已通过 GitLab Token 连接，当前用户 ${currentUser}`,
   });
-
   return currentUser;
 }
 
-function buildActiveMergeRequests(config, roleStates) {
+function buildActiveMergeRequests(config, roleStates, agents) {
   const activeMergeRequests = [];
   const staleAfterMs = Math.max(config.pollIntervalMs * 3, 180_000);
 
   for (const [role, state] of Object.entries(roleStates)) {
     for (const [project, mergeRequests] of Object.entries(state.projects ?? {})) {
+      if (!config.projects.some((item) => item.path === project)) continue;
       for (const [mergeRequestIid, stateEntry] of Object.entries(mergeRequests)) {
         const key = `${project}!${mergeRequestIid}`;
-        const threadId = config.reviewThreads[key]
-          ?? (role === 'developer' ? config.developerThreadId : null)
-          ?? null;
+        const developerAgents = agents.filter((agent) => agent.role === 'developer'
+          && agentMatches(agent, project, mergeRequestIid));
+        const developerThreadId = developerAgents.length
+          ? developerAgents.find((agent) => agent.threadId)?.threadId ?? null
+          : config.developerThreadId || null;
+        const threadId = role === 'developer' ? developerThreadId : config.reviewThreads[key] ?? null;
         const lastSeenTimestamp = Date.parse(stateEntry.lastSeenAt ?? stateEntry.updatedAt ?? '');
         const isStale = !Number.isFinite(lastSeenTimestamp)
           || Date.now() - lastSeenTimestamp > staleAfterMs;
@@ -1345,12 +1374,12 @@ async function buildDashboardOverview(context) {
   const config = await loadConfigSafely();
   const otherRole = context.role === 'reviewer' ? 'developer' : 'reviewer';
   const otherRoleState = await loadState(getStatePath(otherRole));
-  const activeMergeRequests = buildActiveMergeRequests(config, {
+  const agents = await listAgents(serviceHome);
+  const activeMergeRequests = buildActiveMergeRequests({ ...config, developerThreadId: context.runtime.developerThreadId }, {
     [context.role]: context.state,
     [otherRole]: otherRoleState,
-  });
+  }, agents);
   const events = await readWatchEvents(config, 200);
-  const agents = await listAgents(workspaceRoot);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1362,6 +1391,8 @@ async function buildDashboardOverview(context) {
     auth: await buildGitLabAuthState(context),
     config: {
       projects: config.projects,
+      gitlabHost: config.gitlabHost,
+      serviceHome,
       appServerUrl: config.appServerUrl,
       developerThreadId: config.developerThreadId ?? null,
       pollIntervalMs: config.pollIntervalMs,
@@ -1375,6 +1406,7 @@ async function buildDashboardOverview(context) {
     activeMergeRequests,
     events,
     stats: {
+      projectCount: config.projects.length,
       activeCount: activeMergeRequests.filter((mergeRequest) => !mergeRequest.isStale).length,
       mappingCount: Object.keys(config.reviewThreads).length,
       eventCount: events.length,
@@ -1431,10 +1463,8 @@ async function updateMapping(context, key, threadId) {
     throw new Error('threadId 不能为空');
   }
 
+  await mutateConfig((config) => { config.reviewThreads[key] = threadId.trim(); });
   const config = await loadConfigFromDisk();
-  config.reviewThreads[key] = threadId.trim();
-  await saveConfig(config);
-  lastGoodConfig = config;
 
   const project = key.slice(0, key.lastIndexOf('!'));
   const mergeRequestIid = Number(key.slice(key.lastIndexOf('!') + 1));
@@ -1449,15 +1479,13 @@ async function updateMapping(context, key, threadId) {
 }
 
 async function removeMapping(context, key) {
+  let threadId;
+  await mutateConfig((config) => {
+    if (!Object.hasOwn(config.reviewThreads, key)) throw new Error('映射不存在');
+    threadId = config.reviewThreads[key];
+    delete config.reviewThreads[key];
+  });
   const config = await loadConfigFromDisk();
-  if (!Object.prototype.hasOwnProperty.call(config.reviewThreads, key)) {
-    throw new Error('映射不存在');
-  }
-
-  const threadId = config.reviewThreads[key];
-  delete config.reviewThreads[key];
-  await saveConfig(config);
-  lastGoodConfig = config;
 
   const project = key.slice(0, key.lastIndexOf('!'));
   const mergeRequestIid = Number(key.slice(key.lastIndexOf('!') + 1));
@@ -1486,6 +1514,31 @@ async function handleDashboardRequest(request, response, context) {
     return;
   }
 
+  if (requestUrl.pathname === '/api/projects') {
+    try {
+      if (request.method === 'GET') {
+        const config = await loadConfigSafely();
+        sendDashboardJson(response, 200, { projects: config.projects, gitlabHost: config.gitlabHost });
+      } else if (request.method === 'POST') {
+        const body = await readJsonRequestBody(request);
+        await mutateConfig((config) => { prepareProject(config, body); });
+        context.runtime.authVersion += 1;
+        sendDashboardJson(response, 201, await buildDashboardOverview(context));
+      } else if (request.method === 'DELETE') {
+        const path = requestUrl.searchParams.get('path');
+        await mutateConfig((config) => {
+          if (!config.projects.some((project) => project.path === path)) throw new Error('项目不存在');
+          config.projects = config.projects.filter((project) => project.path !== path);
+        });
+        context.runtime.authVersion += 1;
+        sendDashboardJson(response, 200, await buildDashboardOverview(context));
+      } else sendDashboardJson(response, 405, { error: 'method_not_allowed' });
+    } catch (error) {
+      sendDashboardJson(response, 400, { error: error.message });
+    }
+    return;
+  }
+
   if (request.method === 'GET' && requestUrl.pathname === '/api/overview') {
     sendDashboardJson(response, 200, await buildDashboardOverview(context));
     return;
@@ -1499,7 +1552,7 @@ async function handleDashboardRequest(request, response, context) {
   if (request.method === 'POST' && requestUrl.pathname === '/api/auth/gitlab') {
     try {
       const body = await readJsonRequestBody(request);
-      const currentUser = await authenticateGitLab(context, body.token);
+      const currentUser = await authenticateGitLab(context, body.token, body.host);
       sendDashboardJson(response, 200, {
         currentUser,
         ...(await buildDashboardOverview(context)),
@@ -1561,7 +1614,7 @@ async function startDashboard(context) {
   }
 
   const config = await loadConfigSafely();
-  const host = config.dashboardHost ?? DEFAULT_DASHBOARD_HOST;
+  const host = context.options.dashboardHost ?? config.dashboardHost ?? DEFAULT_DASHBOARD_HOST;
   const port = context.options.dashboardPort ?? config.dashboardPort ?? DEFAULT_DASHBOARD_PORT;
   const server = createHttpServer((request, response) => {
     handleDashboardRequest(request, response, context).catch((error) => {
@@ -1623,55 +1676,14 @@ async function run() {
     return;
   }
 
-  const config = await loadConfigSafely();
-  if (options.projectRefs.length > 0) {
-    config.projects = options.projectRefs;
-  }
-  if (options.appServerUrl) {
-    config.appServerUrl = options.appServerUrl;
-  }
-  if (options.reviewModel !== null) {
-    config.reviewModel = options.reviewModel;
-  }
-  if (options.reviewEffort !== null) {
-    config.reviewEffort = options.reviewEffort;
-  }
-  if (options.dashboardHost) {
-    config.dashboardHost = options.dashboardHost;
-  }
-  const role = await resolveRole(options);
-  const targetThreadId = await resolveThreadId(config, role, options);
-  const gitlabInfo = inferGitLabRemote(workspaceRoot);
-  config.gitlabHost = gitlabInfo.host;
-  const gitlab = await createGitLabClient({ workspaceRoot, config });
-  let currentUser = null;
-  try {
-    currentUser = await gitlab.currentUser();
-  } catch (error) {
-    if (typeof config.gitlabUsername === 'string' && config.gitlabUsername.length > 0) {
-      currentUser = config.gitlabUsername;
-    }
-  }
-  const ignoredAuthors = new Set([
-    ...(currentUser ? [currentUser] : []),
-    ...config.ignoreAuthors.map((author) => String(author).trim()).filter((author) => author.length > 0),
-  ]);
-  const appServer = role === 'reviewer'
-    ? createAppServerClient({
-      url: config.appServerUrl,
-      cwd: repoRoot,
-    })
-    : null;
+  const config = applyOptions(await loadConfigSafely(), options, true);
+  const role = await resolveRole(options, config);
   const runtime = {
-    currentUser,
-    ignoredAuthors,
-    appServer,
-    gitlab,
-    authVersion: 0,
-    developerThreadId: role === 'developer' ? targetThreadId : null,
-    project: role === 'developer' ? config.projects[0] : null,
+    options, currentUser: null, gitlab: null, clients: new Map(),
+    clientKey: null, authHost: null, authVersion: 0, appServer: null,
+    developerThreadId: options.thread || config.developerThreadId || null,
   };
-  const intervalMs = options.intervalMs ?? config.pollIntervalMs;
+  let intervalMs = options.intervalMs ?? config.pollIntervalMs;
   const statePath = getStatePath(role);
   await mkdir(dataDir, { recursive: true });
   const state = await loadState(statePath);
@@ -1680,7 +1692,6 @@ async function run() {
     state,
     runtime,
     options,
-    gitlabInfo,
   };
   let shouldStop = false;
   let dashboardServer = null;
@@ -1698,31 +1709,15 @@ async function run() {
   runtimeStatus.startedAt = new Date().toISOString();
 
   console.log(`GitLab MR 自动跟进已启动，角色: ${role}`);
-  console.log(`仓库: ${repoRoot}`);
-  console.log(`GitLab: ${gitlabInfo.webUrl}`);
-  console.log(`项目: ${config.projects.join(', ')}`);
-  console.log(`GitLab 用户: ${currentUser ?? '未认证'}`);
-  console.log(`GitLab 访问: ${gitlab.mode === 'token' ? 'token API' : 'glab fallback'}`);
-  console.log(`轮询间隔: ${intervalMs} ms`);
+  console.log(`服务目录: ${serviceHome}`);
+  console.log(`GitLab: ${config.gitlabHost || '未配置'}`);
+  console.log(`项目: ${config.projects.map(getProjectPath).join(', ') || '暂无项目'}`);
   console.log(`状态文件: ${statePath}`);
-  console.log(`配置映射: ${configPath}`);
-  if (role === 'reviewer') {
-    console.log(`App Server: ${config.appServerUrl}`);
-    try {
-      await runtime.appServer.connect();
-      console.log('App Server 已连接');
-    } catch (error) {
-      console.error(`App Server 连接失败，后续创建线程时会重试: ${error.message}`);
-    }
-  } else {
-    console.log(`开发者处理会话: ${runtime.developerThreadId}`);
-  }
+  console.log(`配置: ${configPath}`);
 
   if (options.notify !== null) {
-    if (!runtime.currentUser) {
-      throw new Error('GitLab 尚未认证，请先通过管理页或 mr-watch auth 完成接入');
-    }
-    await notifyOnce(config, runtime, options);
+    try { await notifyOnce(config, runtime, options); }
+    finally { runtime.appServer?.close(); }
     return;
   }
 
@@ -1732,8 +1727,14 @@ async function run() {
     console.error(`管理页面启动失败: ${error.message}`);
   }
 
-  if (!runtime.currentUser) {
-    console.log('GitLab 尚未认证，请在管理页“设置”中粘贴 Token；认证后会立即开始首轮检查。');
+  // Watch atomic config/credential replacements, including edits made by a separate CLI.
+  const watchers = [];
+  for (const directory of new Set([dirname(configPath), serviceHome])) {
+    watchers.push(watchDirectory(directory, (event, file) => {
+      const name = String(file ?? '');
+      if ((directory === dirname(configPath) && name === basename(configPath))
+          || (directory === serviceHome && name === 'credentials.json')) runtime.authVersion += 1;
+    }));
   }
 
   await recordWatchEventSafely(config, {
@@ -1744,29 +1745,13 @@ async function run() {
 
   try {
     while (!shouldStop) {
-      if (!runtime.currentUser) {
-        if (options.once) {
-          console.log('GitLab 尚未认证，--once 模式不执行检查。');
-          break;
-        }
-
-        const waitStartAuthVersion = runtime.authVersion;
-        runtimeStatus.nextPollAt = new Date(Date.now() + intervalMs).toISOString();
-        await sleep(
-          intervalMs,
-          () => shouldStop,
-          () => runtime.authVersion !== waitStartAuthVersion,
-        );
-        continue;
-      }
-
+      const wakeVersion = runtime.authVersion;
       const startedAt = Date.now();
       runtimeStatus.isPolling = true;
       runtimeStatus.lastPollAt = new Date().toISOString();
 
       try {
-        await pollOnce(role, state, runtime, options);
-        runtimeStatus.lastError = null;
+        intervalMs = await pollOnce(role, state, runtime, options);
       } catch (error) {
         runtimeStatus.lastError = error.message;
         console.error(`[${new Date().toISOString()}] 本轮检查失败: ${error.message}`);
@@ -1793,7 +1778,7 @@ async function run() {
       const elapsedMs = Date.now() - startedAt;
       const waitMs = Math.max(0, intervalMs - elapsedMs);
       if (waitMs > 0) {
-        await sleep(waitMs, () => shouldStop);
+        await sleep(waitMs, () => shouldStop, () => runtime.authVersion !== wakeVersion);
       }
     }
 
@@ -1808,6 +1793,7 @@ async function run() {
     console.log('GitLab MR 自动跟进已停止');
   } finally {
     runtimeStatus.nextPollAt = null;
+    for (const watcher of watchers) watcher.close();
     runtime.appServer?.close();
     if (dashboardServer) {
       await new Promise((resolveClose) => dashboardServer.close(resolveClose));

@@ -1,57 +1,110 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import {
   chmod,
   mkdir,
   readFile,
   rename,
+  rm,
   writeFile,
 } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, isAbsolute } from 'node:path';
 
 export const DEFAULT_APP_SERVER_URL = 'ws://127.0.0.1:18787';
 export const DEFAULT_DASHBOARD_PORT = 8787;
 
-export function resolveWorkspaceRoot(workspacePath = process.cwd()) {
-  let currentDirectory = resolve(workspacePath);
+export function resolveServiceHome(home = null) {
+  return resolve(home || process.env.MR_WATCH_HOME || resolve(homedir(), '.config', 'mr-watch'));
+}
 
-  while (true) {
-    if (existsSync(resolve(currentDirectory, '.git'))) {
-      return currentDirectory;
-    }
+export function getDataDir(serviceHome) {
+  return serviceHome;
+}
 
-    const parentDirectory = dirname(currentDirectory);
-    if (parentDirectory === currentDirectory) {
-      throw new Error(`无法从 ${workspacePath} 找到 Git 仓库根目录`);
-    }
-    currentDirectory = parentDirectory;
+export function normalizeGitLabHost(host = '') {
+  if (!host) return '';
+  const url = new URL(String(host).trim());
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+      || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('gitlabHost 必须是 http(s) 服务地址，不能包含路径或认证信息');
   }
+  return url.origin;
 }
 
-export function getDataDir(workspaceRoot) {
-  return resolve(workspaceRoot, '.mr-watch');
+export function getProjectPath(project) {
+  return project?.path ?? '';
 }
 
-export function getConfigPath(workspaceRoot, configOverride = null) {
+export function getProjectWorkspace(project) {
+  return project?.workspace ?? null;
+}
+
+export function normalizeProject(project) {
+  if (!project || typeof project !== 'object' || Array.isArray(project)) {
+    throw new Error('项目必须是包含 path 和可选 workspace 的对象');
+  }
+  const path = typeof project.path === 'string' ? project.path.trim().replace(/^\/+|\/+$/g, '') : '';
+  if (!/^[^\s/!?#\\]+(?:\/[^\s/!?#\\]+)+$/.test(path)
+      || path.split('/').some((part) => part === '.' || part === '..')) {
+    throw new Error('path 必须是 GitLab project full path，例如 team/project');
+  }
+  const workspace = project.workspace == null || project.workspace === '' ? null : project.workspace;
+  if (workspace !== null && (typeof workspace !== 'string' || !isAbsolute(workspace))) {
+    throw new Error('workspace 必须是本地绝对路径');
+  }
+  return { path, workspace: workspace === null ? null : resolve(workspace) };
+}
+
+export function normalizeProjects(projects) {
+  if (!Array.isArray(projects)) throw new Error('projects 必须是数组');
+  const normalized = projects.map(normalizeProject);
+  if (new Set(normalized.map(getProjectPath)).size !== normalized.length) {
+    throw new Error('项目 path 不能重复');
+  }
+  return normalized;
+}
+
+export function prepareProject(config, input) {
+  let remote = null;
+  if (input.workspace) {
+    if (!isAbsolute(input.workspace)) throw new Error('workspace 必须是本地绝对路径');
+    try { remote = inferGitLabRemote(input.workspace); } catch (error) {
+      if (!input.path) throw error;
+    }
+  }
+  const project = normalizeProject({ ...input, path: input.path || remote?.project });
+  if (remote && config.gitlabHost && normalizeGitLabHost(remote.host) !== config.gitlabHost) {
+    throw new Error('项目 origin 的 host 与服务 gitlabHost 不一致');
+  }
+  if (!config.gitlabHost && remote) config.gitlabHost = normalizeGitLabHost(remote.host);
+  if (config.projects.some((item) => getProjectPath(item) === project.path)) {
+    throw new Error(`项目已存在: ${project.path}`);
+  }
+  config.projects.push(project);
+  return project;
+}
+
+export function getConfigPath(serviceHome, configOverride = null) {
   return configOverride
     ? resolve(configOverride)
-    : resolve(getDataDir(workspaceRoot), 'config.json');
+    : resolve(getDataDir(serviceHome), 'config.json');
 }
 
-export function getAgentsPath(workspaceRoot) {
-  return resolve(getDataDir(workspaceRoot), 'agents.json');
+export function getAgentsPath(serviceHome) {
+  return resolve(getDataDir(serviceHome), 'agents.json');
 }
 
-export function getStatePath(workspaceRoot, role) {
-  return resolve(getDataDir(workspaceRoot), `state-${role}.json`);
+export function getStatePath(serviceHome, role) {
+  return resolve(getDataDir(serviceHome), `state-${role}.json`);
 }
 
-export function getEventLogPath(workspaceRoot) {
-  return resolve(getDataDir(workspaceRoot), 'events.jsonl');
+export function getEventLogPath(serviceHome) {
+  return resolve(getDataDir(serviceHome), 'events.jsonl');
 }
 
-export function getCredentialsPath(workspaceRoot) {
-  return resolve(getDataDir(workspaceRoot), 'credentials.json');
+export function getCredentialsPath(serviceHome) {
+  return resolve(getDataDir(serviceHome), 'credentials.json');
 }
 
 function readOriginRemote(workspaceRoot) {
@@ -103,7 +156,7 @@ function parseRemoteUrl(remoteUrl) {
   throw new Error(`无法从 git remote origin 推断 GitLab 项目: ${remoteUrl}`);
 }
 
-function buildGitLabTokenSettingsUrl(host) {
+export function buildGitLabTokenSettingsUrl(host) {
   const tokenSettingsUrl = new URL(
     '/-/user_settings/personal_access_tokens',
     `${String(host).trim().replace(/\/+$/, '')}/`,
@@ -131,9 +184,12 @@ export function inferGitLabHost(workspaceRoot) {
   return parseRemoteUrl(readOriginRemote(workspaceRoot)).host;
 }
 
-export function createDefaultConfig(workspaceRoot) {
+export function createDefaultConfig() {
   return {
-    projects: [inferGitLabProject(workspaceRoot)],
+    version: 2,
+    role: 'reviewer',
+    gitlabHost: '',
+    projects: [],
     developerThreadId: '',
     pollIntervalMs: 60_000,
     appServerUrl: DEFAULT_APP_SERVER_URL,
@@ -141,7 +197,7 @@ export function createDefaultConfig(workspaceRoot) {
     reviewEffort: '',
     dashboardHost: '127.0.0.1',
     dashboardPort: DEFAULT_DASHBOARD_PORT,
-    watchEventLogPath: './events.jsonl',
+    watchEventLogPath: 'events.jsonl',
     notifyOnStart: false,
     ignoreAuthors: [],
     reviewThreads: {},
@@ -151,14 +207,9 @@ export function createDefaultConfig(workspaceRoot) {
   };
 }
 
-export async function ensureDataDir(workspaceRoot) {
-  const dataDir = getDataDir(workspaceRoot);
-  await mkdir(dataDir, { recursive: true });
-
-  const localIgnorePath = resolve(dataDir, '.gitignore');
-  if (!existsSync(localIgnorePath)) {
-    await writeFile(localIgnorePath, '*\n', 'utf8');
-  }
+export async function ensureDataDir(serviceHome) {
+  const dataDir = getDataDir(serviceHome);
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
 
   return dataDir;
 }
@@ -177,26 +228,29 @@ export async function readJsonFile(filePath, fallback = null) {
 
 export async function writeJsonFile(filePath, value) {
   await mkdir(dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   await rename(temporaryPath, filePath);
 }
 
-export async function loadOrCreateConfig({ workspaceRoot, configPath }) {
-  await ensureDataDir(workspaceRoot);
+export async function loadOrCreateConfig({ serviceHome, configPath }) {
+  await ensureDataDir(serviceHome);
   const existingConfig = await readJsonFile(configPath, null);
   if (existingConfig) {
+    if (existingConfig.version !== 2) throw new Error('config.json 需要 version: 2');
+    existingConfig.projects = normalizeProjects(existingConfig.projects);
+    existingConfig.gitlabHost = normalizeGitLabHost(existingConfig.gitlabHost);
     return existingConfig;
   }
 
-  const defaultConfig = createDefaultConfig(workspaceRoot);
+  const defaultConfig = createDefaultConfig();
   await writeJsonFile(configPath, defaultConfig);
   return defaultConfig;
 }
 
-export async function loadAgentRegistry(workspaceRoot) {
-  await ensureDataDir(workspaceRoot);
-  const registry = await readJsonFile(getAgentsPath(workspaceRoot), null);
+export async function loadAgentRegistry(serviceHome) {
+  await ensureDataDir(serviceHome);
+  const registry = await readJsonFile(getAgentsPath(serviceHome), null);
   if (!registry || !Array.isArray(registry.agents)) {
     return {
       version: 1,
@@ -206,14 +260,14 @@ export async function loadAgentRegistry(workspaceRoot) {
   return registry;
 }
 
-export async function saveAgentRegistry(workspaceRoot, registry) {
-  await ensureDataDir(workspaceRoot);
-  await writeJsonFile(getAgentsPath(workspaceRoot), registry);
+export async function saveAgentRegistry(serviceHome, registry) {
+  await ensureDataDir(serviceHome);
+  await writeJsonFile(getAgentsPath(serviceHome), registry);
 }
 
-export async function loadCredentials(workspaceRoot) {
-  await ensureDataDir(workspaceRoot);
-  const credentials = await readJsonFile(getCredentialsPath(workspaceRoot), null);
+export async function loadCredentials(serviceHome) {
+  await ensureDataDir(serviceHome);
+  const credentials = await readJsonFile(getCredentialsPath(serviceHome), null);
   if (!credentials || typeof credentials.hosts !== 'object' || credentials.hosts === null) {
     return {
       version: 1,
@@ -223,7 +277,7 @@ export async function loadCredentials(workspaceRoot) {
   return credentials;
 }
 
-export async function saveGitLabToken({ workspaceRoot, host, token }) {
+export async function saveGitLabToken({ serviceHome, host, token }) {
   if (typeof token !== 'string' || token.trim().length === 0) {
     throw new Error('token 不能为空');
   }
@@ -233,12 +287,12 @@ export async function saveGitLabToken({ workspaceRoot, host, token }) {
     throw new Error('host 必须是 http(s) URL');
   }
 
-  const credentials = await loadCredentials(workspaceRoot);
+  const credentials = await loadCredentials(serviceHome);
   credentials.hosts[normalizedHost] = {
     token: token.trim(),
     updatedAt: new Date().toISOString(),
   };
-  const credentialsPath = getCredentialsPath(workspaceRoot);
+  const credentialsPath = getCredentialsPath(serviceHome);
   await writeJsonFile(credentialsPath, credentials);
   if (process.platform !== 'win32') {
     await chmod(credentialsPath, 0o600);
@@ -246,17 +300,17 @@ export async function saveGitLabToken({ workspaceRoot, host, token }) {
   return normalizedHost;
 }
 
-export async function resolveGitLabToken(workspaceRoot, host) {
+export async function resolveGitLabToken(serviceHome, host) {
   if (process.env.GITLAB_TOKEN?.trim()) {
     return process.env.GITLAB_TOKEN.trim();
   }
 
-  const credentials = await loadCredentials(workspaceRoot);
+  const credentials = await loadCredentials(serviceHome);
   const normalizedHost = String(host).trim().replace(/\/+$/, '');
   return credentials.hosts[normalizedHost]?.token ?? null;
 }
 
-export async function getGitLabCredentialInfo(workspaceRoot, host) {
+export async function getGitLabCredentialInfo(serviceHome, host) {
   if (process.env.GITLAB_TOKEN?.trim()) {
     return {
       source: 'environment',
@@ -265,7 +319,7 @@ export async function getGitLabCredentialInfo(workspaceRoot, host) {
     };
   }
 
-  const credentials = await loadCredentials(workspaceRoot);
+  const credentials = await loadCredentials(serviceHome);
   const normalizedHost = String(host).trim().replace(/\/+$/, '');
   const credential = credentials.hosts[normalizedHost];
   if (credential?.token) {
@@ -281,4 +335,26 @@ export async function getGitLabCredentialInfo(workspaceRoot, host) {
     hasToken: false,
     updatedAt: null,
   };
+}
+
+// Serialize read/modify/write across the CLI and running service.
+export async function updateConfig({ serviceHome, configPath }, mutate) {
+  await mkdir(dirname(configPath), { recursive: true });
+  const lock = `${configPath}.lock`;
+  const deadline = Date.now() + 5000;
+  while (true) {
+    try { await mkdir(lock); break; } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (Date.now() >= deadline) throw new Error(`配置正在被修改或锁未释放: ${lock}`);
+      await new Promise((done) => setTimeout(done, 25));
+    }
+  }
+  try {
+    const config = await loadOrCreateConfig({ serviceHome, configPath });
+    const result = await mutate(config);
+    await writeJsonFile(configPath, config);
+    return result;
+  } finally {
+    await rm(lock, { recursive: true, force: true });
+  }
 }
