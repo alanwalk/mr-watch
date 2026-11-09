@@ -122,3 +122,7 @@ npx @alanwalk/mr-watch --workspace C:\Workspace\my-project --role developer --th
 - 管理页默认只监听 `127.0.0.1`，不要在没有额外认证的情况下暴露到公网。
 - Token 只保存在本机工作区数据目录，不写入 GitLab 仓库，也不输出到日志或管理页。
 - 程序不会自动合并 MR、提交代码或发布评论；只有明确的会话指令或 hook 处理逻辑才会触发后续动作。
+
+## 后续开发
+
+独立服务化、多项目管理和旧数据迁移方案见 [cloud-server-handoff.md](./docs/cloud-server-handoff.md)。
